@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>巨大旋转肥皂泡</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000; /* 深色背景突出反光 */
+            touch-action: none; /* 阻止默认滚动 */
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            cursor: grab;
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+        #tips {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.4);
+            font-family: sans-serif;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="glcanvas"></canvas>
+    <div id="tips">拖动屏幕旋转泡泡</div>
+
+    <script id="vertex-shader" type="x-shader/x-vertex">
+        attribute vec2 a_position;
+        varying vec2 v_uv;
+
+        void main() {
+            // a_position 是从 -1.0 到 1.0 的正方形顶点
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            // 将坐标传递给片元着色器
+            v_uv = a_position;
+        }
+    </script>
+
+    <script id="fragment-shader" type="x-shader/x-fragment">
+        precision highp float;
+
+        uniform vec2 u_resolution;
+        uniform float u_time;
+        uniform vec2 u_rotation;
+        uniform float u_bubble_radius;
+        uniform ivec2 u_grid_dims;
+        uniform float u_chaos_mode;
+
+        varying vec2 v_uv;
+
+        // 伪随机函数
+        float hash(vec2 p) {
+            p = fract(p * vec2(123.34, 456.21));
+            p += dot(p, p + 45.32);
+            return fract(p.x * p.y);
+        }
+
+        // 定义常量
+        #define PI 3.14159265359
+
+        // 构建旋转矩阵的辅助函数
+        mat2 rotate2d(float angle){
+            return mat2(cos(angle), -sin(angle),
+                        sin(angle), cos(angle));
+        }
+
+        void main() {
+            // 1. 计算当前片段所在的网格位置，并获取局部UV坐标
+            // 将 v_uv [-1, 1] 映射到屏幕空间 [0, 1]
+            vec2 screenUv = (v_uv + 1.0) * 0.5;
+
+            // 计算当前片段在所属网格单元内的局部UV坐标 [-1, 1]
+            vec2 localUv = fract(screenUv * vec2(u_grid_dims.x, u_grid_dims.y)) * 2.0 - 1.0;
+
+            // 核心修复：根据屏幕物理比例和网格行列数计算真正的单元格比例
+            float cellAspect = (u_resolution.x / float(u_grid_dims.x)) / (u_resolution.y / float(u_grid_dims.y));
+            
+            vec2 uv = localUv;
+            if (cellAspect > 1.0) {
+                uv.x *= cellAspect;
+            } else {
+                uv.y /= cellAspect;
+            }
+
+            // 2. 绘制圆形并计算法线
+            float r = length(uv);
+            float bubbleRadius = u_bubble_radius;
+
+            if (r > bubbleRadius) {
+                // 超出圆环区域绘制背景色（黑色）
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                return;
+            }
+
+            // 计算球体表面的 Z 坐标 (假设球心在屏幕平面上)
+            // 归一化半径距离
+            float normalizedR = r / bubbleRadius;
+            float z = sqrt(1.0 - normalizedR * normalizedR);
+            
+            // 基础法线 (尚未旋转)
+            vec3 normal = normalize(vec3(uv.x / bubbleRadius, uv.y / bubbleRadius, z));
+
+            // --- 3. 应用旋转 ---
+            vec3 rotatedNormal = normal;
+            vec2 rot = u_rotation;
+
+            // 混沌模式逻辑
+            if (u_chaos_mode > 0.5) {
+                vec2 gridId = floor(screenUv * vec2(u_grid_dims));
+                float h1 = hash(gridId);
+                float h2 = hash(gridId + vec2(1.0, 1.0));
+                float h3 = hash(gridId + vec2(0.0, 5.0));
+                // 每个泡泡获得独立的随机初始偏置和随时间变化的独立速度
+                rot.x += h1 * 20.0 + u_time * (h2 - 0.5) * 5.0;
+                rot.y += h2 * 20.0 + u_time * (h3 - 0.5) * 5.0;
+            }
+
+            rotatedNormal.xz *= rotate2d(rot.x);
+            rotatedNormal.yz *= rotate2d(rot.y);
+            rotatedNormal = normalize(rotatedNormal);
+
+
+            // --- 4. 物理光学计算 (基于旋转后的法线) ---
+
+            // 观察方向 (始终垂直指向屏幕内)
+            vec3 viewDir = vec3(0.0, 0.0, 1.0);
+
+            // 菲涅尔效应 (Fresnel Effect)
+            // 计算视线与法线的夹角。夹角越大（越靠近边缘），反射越强。
+            float fresnelTerm = dot(viewDir, rotatedNormal);
+            // 使用 1.0 - clamp 确保边缘为 1，中心为 0，并调整曲线使其更陡峭
+            float fresnel = pow(1.0 - clamp(fresnelTerm, 0.0, 1.0), 3.0);
+
+            // 薄膜干涉颜色 (Thin-Film Interference)
+            // 这是一个经验公式，用于模拟肥皂膜厚度不均导致的光谱分离。
+            // 颜色随着菲涅尔角度、时间和一点点固有扭曲而变化。
+            // 使用旋转后的法线分量来增加动态感
+            float interferenceAngle = fresnel * 8.0 + u_time * 0.5 + rotatedNormal.y * 2.0;
+            vec3 interferenceColor = 0.5 + 0.5 * cos(vec3(0.0, 0.33, 0.67) * PI * 2.0 + interferenceAngle);
+            
+            // 环境反射模拟 (Fake Reflection)
+            // 模拟一个虚拟光源/环境贴图的反射
+            vec3 lightDir = normalize(vec3(0.5, 0.8, 1.0)); // 假设右上前方有个光源
+            vec3 reflectDir = reflect(-lightDir, rotatedNormal);
+            float specular = pow(max(dot(viewDir, reflectDir), 0.0), 30.0); // 高光锐度
+            float reflection = smoothstep(0.8, 0.95, specular); // 强化高光点
+
+            // --- 5. 增加 3D 像素化人脸特征块 ---
+            // 使用旋转后的法线分量定位“五官”，max(abs) 创建方块感
+            vec2 eyePos = abs(rotatedNormal.xy - vec2(0.0, 0.3)) - vec2(0.3, 0.0);
+            float eyes = smoothstep(0.1, 0.08, max(abs(eyePos.x), abs(eyePos.y)));
+            float mouth = smoothstep(0.1, 0.08, max(abs(rotatedNormal.x) - 0.2, abs(rotatedNormal.y + 0.35)));
+            float faceFeatures = (eyes + mouth) * step(0.1, abs(rotatedNormal.z));
+
+            // --- 6. 合成最终颜色 ---
+            vec3 finalColor = vec3(0.0);
+            
+            // 添加干涉产生的彩虹色，边缘更亮
+            finalColor += interferenceColor * (fresnel * 1.5 + 0.1);
+            
+            // 添加白色的环境高光反射
+            finalColor += vec3(1.0) * reflection * 0.8;
+
+            // 叠加亮面人脸特征块，赋予 3D 突出感
+            finalColor += vec3(1.0, 1.0, 1.0) * faceFeatures * (fresnel + 0.5);
+
+            // 计算透明度：中心透明，边缘不透明，高光处不透明
+            // 增加特征块处的透明度，强化 3D 视觉
+            float alpha = fresnel * 0.8 + reflection * 0.5 + faceFeatures * 0.7 + 0.1;
+            
+            // 边缘柔化 (Anti-aliasing edge)
+            float edgeSoftness = 1.0 - smoothstep(bubbleRadius - 0.01, bubbleRadius, r);
+            alpha *= edgeSoftness;
+
+            // 最终输出，预乘 Alpha 以获得正确的混合效果（虽然这里背景是黑的）
+            gl_FragColor = vec4(finalColor * alpha, alpha);
+        }
+    </script>
+
+    <script>
+        // --- 1. WebGL 初始化 ---
+        const canvas = document.getElementById('glcanvas');
+        //不需要 depth buffer，因为我们只画一个平面。需要 alpha。
+        const gl = canvas.getContext('webgl', { alpha: true, depth: false, antialias: true });
+
+        if (!gl) {
+            alert("您的浏览器不支持 WebGL，无法展示物理效果。");
+        }
+
+        // 编译 Shader 的辅助函数
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error("Shader compile error:", gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        // 创建程序
+        const vsSource = document.getElementById('vertex-shader').text;
+        const fsSource = document.getElementById('fragment-shader').text;
+        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+             console.error("Program link error:", gl.getProgramInfoLog(program));
+        }
+        gl.useProgram(program);
+
+        // --- 2. 设置几何体 (一个填满屏幕的大四边形) ---
+        // 两个三角形组成一个矩形，覆盖 -1 到 1 的范围
+        const vertices = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+             1.0,  1.0
+        ]);
+        const vertexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+        const a_position = gl.getAttribLocation(program, "a_position");
+        gl.enableVertexAttribArray(a_position);
+        gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+        // 获取 Uniform 位置
+        const u_resolution = gl.getUniformLocation(program, "u_resolution");
+        const u_time = gl.getUniformLocation(program, "u_time");
+        const u_rotation = gl.getUniformLocation(program, "u_rotation");
+        const u_bubble_radius = gl.getUniformLocation(program, "u_bubble_radius");
+        const u_grid_dims = gl.getUniformLocation(program, "u_grid_dims");
+        const u_chaos_mode = gl.getUniformLocation(program, "u_chaos_mode");
+
+        // --- 3. 交互逻辑 (触控旋转与大小调整) ---
+        let rotationX = 0; 
+        let rotationY = 0; 
+        let lastTouchX = 0;
+        let lastTouchY = 0;
+        let isDragging = false;
+        let autoRotateSpeedX = 0.001;
+        let autoRotateSpeedY = 0.0005;
+        let isChaos = false;
+
+        // 泡泡智能布局控制
+        let targetBubbleSize = window.innerWidth / 2; // 默认每行2个左右
+        let numCols = 2;
+        let numRows = 4;
+        const minSize = 50; 
+        const maxSize = 800; 
+        const sizeStep = 30; 
+
+        canvas.addEventListener('touchstart', (e) => {
+            isDragging = true;
+            lastTouchX = e.touches[0].clientX;
+            lastTouchY = e.touches[0].clientY;
+            // 触摸时停止自动旋转，体验更好
+            autoRotateSpeedX = 0;
+            autoRotateSpeedY = 0;
+        }, {passive: false});
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (!isDragging) return;
+            e.preventDefault(); // 防止屏幕滚动
+            const touchX = e.touches[0].clientX;
+            const touchY = e.touches[0].clientY;
+            
+            const deltaX = touchX - lastTouchX;
+            const deltaY = touchY - lastTouchY;
+            
+            // 根据滑动距离更新旋转角度，除以系数来调整灵敏度
+            rotationX += deltaX * 0.005;
+            rotationY += deltaY * 0.005;
+            
+            lastTouchX = touchX;
+            lastTouchY = touchY;
+        }, {passive: false});
+
+        canvas.addEventListener('touchend', () => {
+            isDragging = false;
+            // 手指离开后恢复缓慢的自动旋转，增加动态感
+            autoRotateSpeedX = 0.001 * (Math.random() > 0.5 ? 1 : -1);
+            autoRotateSpeedY = 0.0005 * (Math.random() > 0.5 ? 1 : -1);
+        });
+        
+        // PC 鼠标支持 (可选，方便调试)
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true; lastTouchX = e.clientX; lastTouchY = e.clientY;
+            autoRotateSpeedX = 0; autoRotateSpeedY = 0;
+        });
+        canvas.addEventListener('mousemove', (e) => {
+            if(!isDragging) return;
+            const deltaX = e.clientX - lastTouchX; const deltaY = e.clientY - lastTouchY;
+            rotationX += deltaX * 0.005; rotationY += deltaY * 0.005;
+            lastTouchX = e.clientX; lastTouchY = e.clientY;
+        });
+        canvas.addEventListener('mouseup', () => {
+             isDragging = false;
+             autoRotateSpeedX = 0.001; autoRotateSpeedY = 0.0005;
+        });
+
+
+        // --- 4. 渲染循环 ---
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function render(time) {
+            time *= 0.001; // 转换为秒
+
+            // 如果没有拖动，应用自动旋转
+            if (!isDragging) {
+                rotationX += autoRotateSpeedX;
+                rotationY += autoRotateSpeedY;
+            }
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            // 智能计算布局：确保泡泡是圆的且紧贴
+            numCols = Math.max(1, Math.floor(canvas.width / targetBubbleSize));
+            let cellSize = canvas.width / numCols;
+            numRows = Math.max(1, Math.ceil(canvas.height / cellSize));
+
+            gl.uniform2f(u_resolution, canvas.width, canvas.height);
+            gl.uniform1f(u_time, time);
+            gl.uniform2f(u_rotation, rotationX, rotationY);
+            // 设置半径为 0.98 接近 1.0 实现紧贴效果
+            gl.uniform1f(u_bubble_radius, 0.98);
+            gl.uniform2i(u_grid_dims, numCols, numRows);
+            gl.uniform1f(u_chaos_mode, isChaos ? 1.0 : 0.0);
+
+            // 绘制一个覆盖全屏的矩形 (6个顶点)
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            requestAnimationFrame(render);
+        }
+        render(0);
+
+    </script>
+
+    <!-- 混沌模式切换按钮 -->
+    <div style="position: absolute; bottom: 20px; left: 20px;">
+        <button id="chaos-toggle" style="background-color: rgba(255,100,100,0.5); border: 2px solid white; color: white; padding: 10px 15px; cursor: pointer; border-radius: 5px; font-family: sans-serif;">混沌模式: 关</button>
+    </div>
+    <!-- 大小调节按钮 -->
+    <div style="position: absolute; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 10px;">
+        <button id="increase-bubble" style="background-color: rgba(255,255,255,0.4); border: none; color: white; padding: 10px 15px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 5px;">+</button>
+        <button id="decrease-bubble" style="background-color: rgba(255,255,255,0.4); border: none; color: white; padding: 10px 15px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 5px;">-</button>
+    </div>
+
+    <script>
+        // ... (之前的 JS 代码) ...
+
+        // --- 5. 大小调节按钮事件 --- 
+        const increaseButton = document.getElementById('increase-bubble');
+        const decreaseButton = document.getElementById('decrease-bubble');
+
+        // 修改 shader 中 bubbleRadius 的值，或者传递一个 uniform
+        // 由于 shader 的 bubbleRadius 是一个常量，直接修改 shader 比较困难。
+        // 更灵活的方式是添加一个 uniform `u_bubble_scale` 到 shader
+        // 然后在这里动态更新它。
+        // 为了演示，我们先直接修改 shader 中 `bubbleRadius` 的值，这需要重新编译 shader。
+        // 或者，修改 shader 接收一个 `u_bubble_radius` uniform。
+
+        // **假设我们修改了 shader，添加了 `uniform float u_bubble_radius;` 并使用它代替 `bubbleRadius`**
+        // const u_bubble_radius = gl.getUniformLocation(program, "u_bubble_radius"); // 需要在 shader 中定义 u_bubble_radius
+
+        increaseButton.addEventListener('click', () => {
+            targetBubbleSize = Math.max(minSize, targetBubbleSize - sizeStep);
+        });
+
+        decreaseButton.addEventListener('click', () => {
+            targetBubbleSize = Math.min(maxSize, targetBubbleSize + sizeStep);
+        });
+
+        const chaosButton = document.getElementById('chaos-toggle');
+        chaosButton.addEventListener('click', () => {
+            isChaos = !isChaos;
+            chaosButton.innerText = `混沌模式: ${isChaos ? '开' : '关'}`;
+            chaosButton.style.backgroundColor = isChaos ? 'rgba(100,255,100,0.5)' : 'rgba(255,100,100,0.5)';
+        });
+
+        // **重要提示：**
+        // 1. 你需要修改 fragment shader，将 `float bubbleRadius = 0.9;` 替换为 `uniform float u_bubble_radius;`。
+        // 2. 你需要在 JS 中获取 `u_bubble_radius` 的 location: `const u_bubble_radius = gl.getUniformLocation(program, "u_bubble_radius");`。
+        // 3. 在 `render` 函数中，你需要在更新其他 uniform 之后，更新 `u_bubble_radius`：`gl.uniform1f(u_bubble_radius, 0.9 * bubbleScale);`。 
+        //    这里的 `0.9` 是原始的 `bubbleRadius` 值，你也可以根据需要调整。
+        // 4. 初始调用 `resize` 后，也需要设置一次 `u_bubble_radius`。
+
+    </script>
+</body>
+</html>
