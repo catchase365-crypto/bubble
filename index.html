@@ -56,6 +56,8 @@
         uniform float u_bubble_radius;
         uniform ivec2 u_grid_dims;
         uniform float u_chaos_mode;
+        uniform sampler2D u_texture;
+        uniform vec2 u_tex_res;
 
         varying vec2 v_uv;
 
@@ -156,12 +158,22 @@
             float specular = pow(max(dot(viewDir, reflectDir), 0.0), 30.0); // 高光锐度
             float reflection = smoothstep(0.8, 0.95, specular); // 强化高光点
 
-            // --- 5. 增加 3D 像素化人脸特征块 ---
-            // 使用旋转后的法线分量定位“五官”，max(abs) 创建方块感
-            vec2 eyePos = abs(rotatedNormal.xy - vec2(0.0, 0.3)) - vec2(0.3, 0.0);
-            float eyes = smoothstep(0.1, 0.08, max(abs(eyePos.x), abs(eyePos.y)));
-            float mouth = smoothstep(0.1, 0.08, max(abs(rotatedNormal.x) - 0.2, abs(rotatedNormal.y + 0.35)));
-            float faceFeatures = (eyes + mouth) * step(0.1, abs(rotatedNormal.z));
+            // --- 5. 实时摄像头镜像 (哈哈镜效果) ---
+            // 使用旋转后的法线 XY 作为球体贴图坐标
+            vec2 texCoord = rotatedNormal.xy;
+            
+            // 裁剪逻辑：确保画面不压缩，取中间的正方形区域
+            float texAspect = u_tex_res.x / u_tex_res.y;
+            vec2 sampleUv = texCoord * 0.5 + 0.5;
+            if (texAspect > 1.0) {
+                sampleUv.x = (sampleUv.x - 0.5) / texAspect + 0.5;
+            } else {
+                sampleUv.y = (sampleUv.y - 0.5) * texAspect + 0.5;
+            }
+            
+            // 采样摄像头画面，只在球体前半部分显示
+            vec3 camColor = texture2D(u_texture, vec2(sampleUv.x, 1.0 - sampleUv.y)).rgb;
+            float faceMask = step(0.0, rotatedNormal.z);
 
             // --- 6. 合成最终颜色 ---
             vec3 finalColor = vec3(0.0);
@@ -172,12 +184,11 @@
             // 添加白色的环境高光反射
             finalColor += vec3(1.0) * reflection * 0.8;
 
-            // 叠加亮面人脸特征块，赋予 3D 突出感
-            finalColor += vec3(1.0, 1.0, 1.0) * faceFeatures * (fresnel + 0.5);
+            // 叠加摄像头画面，使其看起来像在泡泡表面
+            finalColor += camColor * faceMask * (1.2 - fresnel);
 
             // 计算透明度：中心透明，边缘不透明，高光处不透明
-            // 增加特征块处的透明度，强化 3D 视觉
-            float alpha = fresnel * 0.8 + reflection * 0.5 + faceFeatures * 0.7 + 0.1;
+            float alpha = fresnel * 0.8 + reflection * 0.5 + (faceMask * 0.4) + 0.1;
             
             // 边缘柔化 (Anti-aliasing edge)
             float edgeSoftness = 1.0 - smoothstep(bubbleRadius - 0.01, bubbleRadius, r);
@@ -251,6 +262,30 @@
         const u_bubble_radius = gl.getUniformLocation(program, "u_bubble_radius");
         const u_grid_dims = gl.getUniformLocation(program, "u_grid_dims");
         const u_chaos_mode = gl.getUniformLocation(program, "u_chaos_mode");
+        const u_texture = gl.getUniformLocation(program, "u_texture");
+        const u_tex_res = gl.getUniformLocation(program, "u_tex_res");
+
+        // --- 摄像头初始化 ---
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.muted = true;
+        video.playsInline = true;
+        const camTexture = gl.createTexture();
+        
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } }).then(stream => {
+            video.srcObject = stream;
+            video.play();
+        }).catch(err => console.error("相机开启失败:", err));
+
+        function updateTexture() {
+            gl.bindTexture(gl.TEXTURE_2D, camTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            if (video.readyState >= video.HAVE_CURRENT_DATA) {
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+            }
+        }
 
         // --- 3. 交互逻辑 (触控旋转与大小调整) ---
         let rotationX = 0; 
@@ -353,6 +388,10 @@
             gl.uniform1f(u_bubble_radius, 0.98);
             gl.uniform2i(u_grid_dims, numCols, numRows);
             gl.uniform1f(u_chaos_mode, isChaos ? 1.0 : 0.0);
+            
+            updateTexture();
+            gl.uniform2f(u_tex_res, video.videoWidth || 1, video.videoHeight || 1);
+            gl.uniform1i(u_texture, 0);
 
             // 绘制一个覆盖全屏的矩形 (6个顶点)
             gl.drawArrays(gl.TRIANGLES, 0, 6);
