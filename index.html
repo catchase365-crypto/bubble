@@ -165,6 +165,7 @@
             // 裁剪逻辑：确保画面不压缩，取中间的正方形区域
             float texAspect = u_tex_res.x / u_tex_res.y;
             vec2 sampleUv = texCoord * 0.5 + 0.5;
+            sampleUv.x = 1.0 - sampleUv.x; // 水平镜像翻转，使摄像头动作同步
             if (texAspect > 1.0) {
                 sampleUv.x = (sampleUv.x - 0.5) / texAspect + 0.5;
             } else {
